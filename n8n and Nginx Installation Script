@@ -1,0 +1,528 @@
+ #!/usr/bin/env python3
+
+import os
+import subprocess
+import shlex
+import time
+import sys
+import getpass
+
+# --- Configuration ---
+# These can be pre-filled if you're customizing the script,
+# otherwise, the script will prompt for them.
+DEFAULT_N8N_DOMAIN = ""  # e.g., "n8n.yourdomain.com"
+DEFAULT_EMAIL = ""       # For Let's Encrypt
+DEFAULT_N8N_USER = "root" # "n8n" or "root". For simplicity, using root as per user's final setup.
+DEFAULT_N8N_GROUP = "root" # "n8n" or "root"
+
+# --- Helper Functions ---
+def print_info(message):
+    """Prints an informational message."""
+    print(f"\033[94m[INFO] {message}\033[0m")
+
+def print_success(message):
+    """Prints a success message."""
+    print(f"\033[92m[SUCCESS] {message}\033[0m")
+
+def print_warning(message):
+    """Prints a warning message."""
+    print(f"\033[93m[WARNING] {message}\033[0m")
+
+def print_error(message):
+    """Prints an error message and exits if critical."""
+    print(f"\033[91m[ERROR] {message}\033[0m")
+
+def run_command(command, check=True, shell=False, capture_output=False, text=True, cwd=None):
+    """Runs a shell command."""
+    print_info(f"Executing: {command}")
+    try:
+        if shell:
+            process = subprocess.run(command, check=check, shell=True, capture_output=capture_output, text=text, cwd=cwd)
+        else:
+            process = subprocess.run(shlex.split(command), check=check, capture_output=capture_output, text=text, cwd=cwd)
+        if capture_output:
+            return process
+        return True
+    except subprocess.CalledProcessError as e:
+        print_error(f"Command failed: {e}")
+        if e.stderr:
+            print_error(f"Stderr: {e.stderr}")
+        if e.stdout:
+            print_error(f"Stdout: {e.stdout}")
+        if check: # Only exit if check is True
+             sys.exit(1)
+        return False
+    except FileNotFoundError:
+        print_error(f"Command not found: {shlex.split(command)[0]}")
+        if check:
+            sys.exit(1)
+        return False
+
+def create_file(filepath, content, permissions=None):
+    """Creates a file with given content and permissions."""
+    print_info(f"Creating file: {filepath}")
+    try:
+        with open(filepath, "w") as f:
+            f.write(content)
+        if permissions:
+            os.chmod(filepath, permissions)
+        print_success(f"File created: {filepath}")
+    except IOError as e:
+        print_error(f"Failed to create file {filepath}: {e}")
+        sys.exit(1)
+
+def check_root():
+    """Checks if the script is run as root."""
+    if os.geteuid() != 0:
+        print_error("This script must be run as root. Please use sudo.")
+        sys.exit(1)
+    print_info("Running as root.")
+
+def get_user_inputs():
+    """Gets necessary inputs from the user."""
+    config = {}
+    print_info("Please provide the following information:")
+
+    while True:
+        domain = input(f"Enter the domain for n8n (e.g., n8n.example.com) [{DEFAULT_N8N_DOMAIN}]: ") or DEFAULT_N8N_DOMAIN
+        if domain:
+            config["n8n_domain"] = domain
+            break
+        print_warning("Domain name cannot be empty.")
+
+    while True:
+        email = input(f"Enter your email address (for Let's Encrypt renewals) [{DEFAULT_EMAIL}]: ") or DEFAULT_EMAIL
+        if "@" in email and "." in email: # Basic email validation
+            config["email"] = email
+            break
+        print_warning("Please enter a valid email address.")
+
+    print_info("\nCloudflare API Credentials for Certbot DNS Challenge:")
+    print_warning("Ensure the API token has 'Zone:DNS:Edit' permissions for your domain,")
+    print_warning("or use your Global API Key (less recommended).")
+
+    while True:
+        cf_auth_method = input("Use Cloudflare API Token (T) or Global API Key (K)? [T]: ").strip().upper() or "T"
+        if cf_auth_method in ["T", "K"]:
+            break
+        print_warning("Invalid choice. Enter T or K.")
+
+    if cf_auth_method == "T":
+        while True:
+            cf_api_token = getpass.getpass("Enter your Cloudflare API Token: ")
+            if cf_api_token:
+                config["cf_api_token"] = cf_api_token
+                break
+            print_warning("API Token cannot be empty.")
+    else: # Global API Key
+        while True:
+            cf_email = input(f"Enter your Cloudflare account email [{config['email']}]: ") or config["email"]
+            if "@" in cf_email and "." in cf_email:
+                config["cf_email_for_api_key"] = cf_email
+                break
+            print_warning("Please enter a valid Cloudflare email address.")
+        while True:
+            cf_global_api_key = getpass.getpass("Enter your Cloudflare Global API Key: ")
+            if cf_global_api_key:
+                config["cf_global_api_key"] = cf_global_api_key
+                break
+            print_warning("Global API Key cannot be empty.")
+    
+    config["n8n_user"] = DEFAULT_N8N_USER
+    config["n8n_group"] = DEFAULT_N8N_GROUP
+    if DEFAULT_N8N_USER == "root":
+        config["n8n_home_dir"] = "/root"
+    else:
+        config["n8n_home_dir"] = f"/home/{DEFAULT_N8N_USER}"
+
+
+    print_info("\n--- Configuration Summary ---")
+    print_info(f"n8n Domain: {config['n8n_domain']}")
+    print_info(f"Let's Encrypt Email: {config['email']}")
+    print_info(f"n8n Service User: {config['n8n_user']}")
+    print_info(f"n8n Service Group: {config['n8n_group']}")
+    print_info(f"n8n Data Directory: {config['n8n_home_dir']}/.n8n")
+    if "cf_api_token" in config:
+        print_info("Cloudflare Auth: API Token (provided)")
+    else:
+        print_info(f"Cloudflare Auth: Global API Key for {config['cf_email_for_api_key']} (provided)")
+    
+    confirm = input("Proceed with this configuration? (yes/no): ").strip().lower()
+    if confirm != "yes":
+        print_info("Installation aborted by user.")
+        sys.exit(0)
+        
+    return config
+
+# --- Installation Steps ---
+
+def install_prerequisites():
+    """Installs system prerequisites."""
+    print_info("Updating package lists...")
+    run_command("apt update -y")
+    
+    print_info("Installing essential packages (curl, gnupg, lsb-release, nginx, certbot, python3 plugins)...")
+    packages = [
+        "curl", "gnupg", "lsb-release", "nginx", "certbot", 
+        "python3-certbot-nginx", "python3-certbot-dns-cloudflare",
+        "apt-transport-https", "ca-certificates", "software-properties-common" # For adding repos
+    ]
+    run_command(f"apt install -y {' '.join(packages)}")
+
+def install_nodejs():
+    """Installs Node.js v20.x from NodeSource."""
+    print_info("Installing Node.js v20.x...")
+    # Check if NodeSource key already exists
+    if not os.path.exists("/etc/apt/keyrings/nodesource.gpg"):
+        run_command("mkdir -p /etc/apt/keyrings")
+        run_command("curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg")
+    
+    # Check if NodeSource list file already exists
+    if not os.path.exists("/etc/apt/sources.list.d/nodesource.list"):
+        run_command("echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main' | tee /etc/apt/sources.list.d/nodesource.list")
+    
+    run_command("apt update -y")
+    run_command("apt install -y nodejs")
+    run_command("node -v")
+    run_command("npm -v")
+
+def install_n8n():
+    """Installs n8n globally via npm."""
+    print_info("Installing n8n globally via npm (this may take a few minutes)...")
+    run_command("npm install -g n8n@latest")
+    # Verify n8n installation path
+    n8n_path_process = run_command("which n8n", capture_output=True)
+    if n8n_path_process and n8n_path_process.stdout:
+        n8n_executable_path = n8n_path_process.stdout.strip()
+        print_success(f"n8n installed at: {n8n_executable_path}")
+        return n8n_executable_path
+    else:
+        print_error("Could not find n8n executable path after installation.")
+        sys.exit(1)
+
+def setup_n8n_user_and_env(config):
+    """Sets up n8n user, group, and data directory."""
+    n8n_user = config["n8n_user"]
+    n8n_group = config["n8n_group"]
+    n8n_home = config["n8n_home_dir"]
+    n8n_data_dir = f"{n8n_home}/.n8n"
+
+    if n8n_user != "root":
+        print_warning(f"Script is configured to run n8n as '{n8n_user}'.")
+        print_warning("For production, it's recommended to use a dedicated unprivileged user.")
+        print_warning("This script will create the user and group if they don't exist.")
+        
+        # Check if group exists
+        group_exists_process = run_command(f"getent group {n8n_group}", check=False, capture_output=True)
+        if group_exists_process.returncode != 0:
+            print_info(f"Creating group: {n8n_group}")
+            run_command(f"groupadd {n8n_group}")
+        else:
+            print_info(f"Group {n8n_group} already exists.")
+
+        # Check if user exists
+        user_exists_process = run_command(f"id -u {n8n_user}", check=False, capture_output=True)
+        if user_exists_process.returncode != 0:
+            print_info(f"Creating user: {n8n_user}")
+            run_command(f"useradd -r -g {n8n_group} -d {n8n_home} -s /bin/bash {n8n_user}")
+        else:
+            print_info(f"User {n8n_user} already exists.")
+    else:
+        print_info("n8n will be run as root. Data directory will be in /root/.n8n.")
+
+    print_info(f"Creating n8n data directory: {n8n_data_dir}")
+    run_command(f"mkdir -p {n8n_data_dir}")
+    
+    if n8n_user != "root":
+        print_info(f"Setting ownership of {n8n_data_dir} to {n8n_user}:{n8n_group}")
+        run_command(f"chown -R {n8n_user}:{n8n_group} {n8n_home}") # chown home dir too
+        run_command(f"chmod -R 750 {n8n_data_dir}") # More restrictive permissions
+        run_command(f"chmod 750 {n8n_home}")
+    else: # For root user
+        run_command(f"chown -R root:root {n8n_data_dir}")
+        run_command(f"chmod -R 700 {n8n_data_dir}")
+
+
+def create_n8n_service(config, n8n_executable_path):
+    """Creates and enables the n8n systemd service."""
+    print_info("Creating n8n systemd service file...")
+    n8n_domain = config["n8n_domain"]
+    n8n_user = config["n8n_user"]
+    n8n_group = config["n8n_group"]
+    n8n_working_dir = f"{config['n8n_home_dir']}/.n8n"
+
+    # Basic Auth - for simplicity, not enabling by default in script. User can add manually.
+    # N8N_BASIC_AUTH_USER = "your_secure_user"
+    # N8N_BASIC_AUTH_PASSWORD = "your_very_secure_password"
+    # Environment="N8N_BASIC_AUTH_ACTIVE=true"
+    # Environment="N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}"
+    # Environment="N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}"
+
+    service_content = f"""[Unit]
+Description=n8n Workflow Automation
+After=network.target
+
+[Service]
+Type=simple
+User={n8n_user}
+Group={n8n_group}
+WorkingDirectory={n8n_working_dir}
+ExecStart={n8n_executable_path}
+Restart=always
+RestartSec=10
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=n8n
+Environment="N8N_PORT=5678"
+Environment="N8N_PROTOCOL=http"
+Environment="N8N_HOST={n8n_domain}"
+Environment="WEBHOOK_URL=https://{n8n_domain}/"
+# Environment="N8N_SECURE_COOKIE=false" # Only if behind a trusted proxy and experiencing issues.
+# Add other environment variables as needed, e.g., for database, encryption key, etc.
+# Environment="GENERIC_TIMEZONE=America/New_York" # Example: Set your timezone
+
+[Install]
+WantedBy=multi-user.target
+"""
+    create_file("/etc/systemd/system/n8n.service", service_content)
+
+    print_info("Reloading systemd daemon, enabling and starting n8n service...")
+    run_command("systemctl daemon-reload")
+    run_command("systemctl enable n8n.service")
+    run_command("systemctl start n8n.service")
+    
+    print_info("Waiting a few seconds for n8n to start...")
+    time.sleep(10)
+    run_command("systemctl status n8n.service", check=False) # Don't exit if status fails immediately
+
+def setup_nginx(config):
+    """Sets up Nginx configuration for n8n."""
+    n8n_domain = config["n8n_domain"]
+    nginx_conf_path = f"/etc/nginx/sites-available/{n8n_domain}.conf"
+    
+    print_info(f"Creating Nginx server block for {n8n_domain}...")
+
+    # Initial HTTP block for Certbot (if Certbot doesn't handle it fully with --nginx)
+    # This version is more robust for certonly --dns-cloudflare, then configuring SSL manually.
+    nginx_http_conf_content = f"""server {{
+    listen 80;
+    listen [::]:80;
+    server_name {n8n_domain};
+
+    # Location for Let's Encrypt ACME challenge (if needed for renewal, though DNS challenge is primary)
+    location /.well-known/acme-challenge/ {{
+        root /var/www/html; # Default webroot, ensure it exists
+        allow all;
+    }}
+
+    location / {{
+        return 301 https://$host$request_uri;
+    }}
+}}
+"""
+    # This HTTPS block will be populated after certs are obtained
+    nginx_https_conf_content = f"""server {{
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name {n8n_domain};
+
+    ssl_certificate /etc/letsencrypt/live/{n8n_domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{n8n_domain}/privkey.pem;
+    
+    # Include Let's Encrypt's recommended SSL parameters
+    # Or use your own (like the ones from user's successful config)
+    # ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # If generated by Certbot
+
+    # Recommended SSL settings from user's successful config
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers "EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH";
+    ssl_ecdh_curve secp384r1;
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    resolver 8.8.8.8 8.8.4.4 valid=300s; # Google DNS, or your preferred
+    resolver_timeout 5s;
+
+    # Security Headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    # add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' wss://{n8n_domain};" always;
+
+
+    location / {{
+        proxy_pass http://localhost:5678; # n8n runs on port 5678
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # WebSocket support
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_http_version 1.1;
+        
+        proxy_buffering off; # Important for real-time updates in n8n UI
+        proxy_request_buffering off; # Also good for n8n
+        
+        # Timeouts (user's values)
+        proxy_read_timeout 86400s; 
+        proxy_send_timeout 86400s;
+        send_timeout 86400s;
+        client_max_body_size 100M; # Allow larger file uploads if needed
+    }}
+}}
+"""
+    # Initially, we only write the HTTP part to allow Certbot to work if it needs HTTP challenge for some reason
+    # or just to have a placeholder. The script will overwrite this after certs are obtained.
+    combined_nginx_conf = f"{nginx_http_conf_content}\n\n{nginx_https_conf_content}"
+    create_file(nginx_conf_path, combined_nginx_conf) # Write the full config now
+
+    # Remove default Nginx site if it exists to avoid conflicts
+    default_nginx_symlink = "/etc/nginx/sites-enabled/default"
+    if os.path.islink(default_nginx_symlink):
+        print_info("Removing default Nginx site symlink...")
+        run_command(f"rm -f {default_nginx_symlink}")
+    elif os.path.exists(default_nginx_symlink):
+        print_warning(f"{default_nginx_symlink} exists but is not a symlink. Manual check advised.")
+
+
+    # Enable the new site
+    enabled_site_path = f"/etc/nginx/sites-enabled/{n8n_domain}.conf"
+    if os.path.exists(enabled_site_path):
+        print_info(f"Symlink {enabled_site_path} already exists. Removing to recreate.")
+        run_command(f"rm -f {enabled_site_path}")
+        
+    run_command(f"ln -s {nginx_conf_path} {enabled_site_path}")
+
+    print_info("Testing Nginx configuration...")
+    if not run_command("nginx -t", check=False):
+        print_error("Nginx configuration test failed. Please check the Nginx config file and logs.")
+        print_error(f"Config file is at: {nginx_conf_path}")
+        sys.exit(1)
+    
+    print_info("Reloading Nginx...")
+    run_command("systemctl reload nginx")
+    return nginx_https_conf_content # Return the HTTPS part for later use
+
+def obtain_ssl_certificate(config):
+    """Obtains SSL certificate using Certbot with Cloudflare DNS."""
+    n8n_domain = config["n8n_domain"]
+    email = config["email"]
+    
+    # Create Cloudflare credentials file
+    # It's better to put this in /etc/letsencrypt for security, but /root for script simplicity for now.
+    # Ensure this directory is secure if you change it.
+    os.makedirs("/root/.secrets", exist_ok=True) # Ensure .secrets dir exists
+    cloudflare_ini_path = "/root/.secrets/cloudflare.ini" 
+    
+    cf_ini_content = ""
+    if "cf_api_token" in config:
+        cf_ini_content = f"dns_cloudflare_api_token = {config['cf_api_token']}\n"
+    else:
+        cf_ini_content = f"dns_cloudflare_email = {config['cf_email_for_api_key']}\ndns_cloudflare_api_key = {config['cf_global_api_key']}\n"
+    
+    create_file(cloudflare_ini_path, cf_ini_content, permissions=0o600) # Secure permissions
+
+    print_info(f"Requesting SSL certificate for {n8n_domain} using Cloudflare DNS challenge...")
+    certbot_command = (
+        f"certbot certonly --dns-cloudflare "
+        f"--dns-cloudflare-credentials {cloudflare_ini_path} "
+        f"--dns-cloudflare-propagation-seconds 60 " # Wait for DNS propagation
+        f"-d {n8n_domain} --non-interactive --agree-tos -m {email} "
+        f"--keep-until-expiring --expand" # Add --force-renewal if testing repeatedly
+    )
+    
+    # It's good practice to stop Nginx temporarily if using HTTP challenge,
+    # but for DNS challenge, it's not strictly necessary.
+    # However, if Certbot tries to verify via HTTP after DNS, Nginx needs to serve the challenge.
+    # The Nginx config already has a /.well-known/acme-challenge/ location.
+
+    if not run_command(certbot_command, check=False):
+        print_error("Certbot failed to obtain SSL certificate. Check /var/log/letsencrypt/letsencrypt.log for details.")
+        print_warning(f"Ensure your Cloudflare credentials in {cloudflare_ini_path} are correct and have Zone:DNS:Edit permissions.")
+        print_warning(f"Also ensure that the domain {n8n_domain} is correctly set up in Cloudflare.")
+        sys.exit(1)
+
+    print_success(f"SSL certificate obtained for {n8n_domain}.")
+    
+    # Clean up Cloudflare credentials file (optional, but good practice)
+    # os.remove(cloudflare_ini_path)
+    # print_info(f"Removed temporary Cloudflare credentials file: {cloudflare_ini_path}")
+    print_warning(f"Cloudflare credentials file at {cloudflare_ini_path} was NOT removed. Secure or remove it manually if desired.")
+
+
+def configure_firewall():
+    """Configures UFW firewall if available."""
+    ufw_check = run_command("command -v ufw", shell=True, check=False, capture_output=True)
+    if ufw_check.returncode == 0:
+        print_info("UFW detected. Configuring firewall rules...")
+        run_command("ufw allow 'Nginx Full'") # Allows HTTP and HTTPS
+        run_command("ufw allow ssh") # Ensure SSH is allowed
+        
+        # Check UFW status
+        ufw_status_process = run_command("ufw status", capture_output=True, check=False)
+        if "inactive" in ufw_status_process.stdout.lower():
+            print_info("UFW is inactive. Enabling UFW...")
+            # ufw enable can be disruptive if SSH rule is not set or if running over serial.
+            # For a script, it's safer to inform the user.
+            print_warning("UFW is currently inactive. To enable it, run 'sudo ufw enable'.")
+            print_warning("Ensure you have allowed SSH access (port 22) before enabling if you are connected via SSH.")
+            # run_command("ufw enable", shell=True) # This might require interactive 'y'
+        else:
+            print_success("UFW rules applied. Current status:")
+            run_command("ufw status verbose", check=False)
+    else:
+        print_warning("UFW not found. Skipping firewall configuration. Please configure your firewall manually if needed.")
+
+
+# --- Main Execution ---
+def main():
+    """Main script execution flow."""
+    check_root()
+    config = get_user_inputs()
+
+    print_info("\nStarting n8n and Nginx installation process...\n")
+
+    install_prerequisites()
+    install_nodejs()
+    n8n_executable_path = install_n8n()
+    
+    setup_n8n_user_and_env(config) # Must be before creating service if using non-root user
+    create_n8n_service(config, n8n_executable_path)
+    
+    # Initial Nginx setup (HTTP block)
+    # The setup_nginx function now writes the full config directly.
+    # The obtain_ssl_certificate step will then use this Nginx if needed for HTTP validation fallback.
+    # If certs are obtained, Nginx config should already point to them.
+    
+    # Stop Nginx before Certbot if Certbot is going to use standalone or modify Nginx directly.
+    # For certonly --dns-cloudflare, Nginx doesn't need to be stopped.
+    # run_command("systemctl stop nginx", check=False) 
+    
+    obtain_ssl_certificate(config) # This gets the certs
+    
+    # Now that certs exist, ensure Nginx config is correct and reload.
+    # The setup_nginx function has already created the full config.
+    # We just need to ensure Nginx is started/reloaded with it.
+    setup_nginx(config) # This will create/update and reload Nginx with SSL config.
+
+    configure_firewall()
+
+    print_success("\n--- Installation and Configuration Complete! ---")
+    print_info(f"n8n should be accessible at: https://{config['n8n_domain']}")
+    print_info("It might take a few minutes for n8n to fully initialize.")
+    print_info("Check n8n service status: systemctl status n8n")
+    print_info("Check Nginx service status: systemctl status nginx")
+    print_info("n8n logs: journalctl -u n8n -f")
+    print_info("Nginx error logs: /var/log/nginx/error.log")
+    print_warning(f"Remember to secure or remove the Cloudflare credentials file at /root/.secrets/cloudflare.ini if you no longer need it there.")
+    if config["n8n_user"] == "root":
+        print_warning("n8n is currently running as root. For better security in production, consider running it as a dedicated unprivileged user.")
+
+if __name__ == "__main__":
+    main()
+
