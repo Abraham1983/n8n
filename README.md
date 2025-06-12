@@ -74,7 +74,4 @@ After the script completes:
 
 If you'd like to contribute, please fork the repository and use a feature branch. Pull requests are warmly welcome.
 
-## License (Optional)
 
-Consider adding a license file (e.g., MIT, Apache 2.0). For example, create a `LICENSE` file and put the text of the MIT license in it if you choose that.
-Image for your "n8n script" GitH
